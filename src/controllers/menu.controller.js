@@ -6,6 +6,7 @@ import { ApiError } from '../utils/ApiError.js';
 const menuItemSchema = z.object({
   name: z.string().trim().min(1),
   image: z.string().trim().min(1),
+  price: z.coerce.number().finite().nonnegative(),
   isActive: z.boolean().optional().default(false),
 }).strict();
 

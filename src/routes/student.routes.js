@@ -14,6 +14,10 @@ const router = Router();
 
 router.get('/', protect, getStudents);
 router.get('/lookup', lookupStudent);
+// Register bulk routes before parameterized routes
+router.post('/bulk-recharge', protect, bulkRecharge);
+router.post('/:id/recharge', protect, rechargeStudent);
+router.get('/debtors', protect, getDebtors);
 router.post('/import', protect, importStudentRows);
 router.get('/export', protect, exportStudentRows);
 router.post('/', protect, createStudent);

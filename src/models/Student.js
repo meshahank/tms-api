@@ -68,6 +68,14 @@ const studentSchema = new mongoose.Schema({
     type: [transactionSchema],
     default: [],
   },
+  rechargeHistory: {
+    type: [new mongoose.Schema({ date: Date, amount: Number, note: String }, { _id: true })],
+    default: [],
+  },
+  dailyLimit: {
+    type: Number,
+    default: null,
+  },
 }, {
   timestamps: true,
 });

@@ -1,6 +1,6 @@
 # Teapetti — Backend Documentation
 
-> Campus Coffee Shop · College Students Union · v1.0
+> Campus Coffee Shop · College Students Union · v2.0
 
 ---
 
@@ -17,7 +17,7 @@
    - [Sales](#63-sale-routes)
    - [Menu](#64-menu-routes)
 7. [Business Logic](#7-business-logic)
-8. [Excel Import/Export](#8-excel-importexport)
+8. [Excel Import/Export & Reports](#8-excel-importexport--reports)
 9. [Error Handling](#9-error-handling)
 10. [Scripts & Setup](#10-scripts--setup)
 
@@ -48,20 +48,20 @@ Teapetti-backend/
 │   │   └── db.js              # MongoDB connection
 │   │
 │   ├── models/
-│   │   ├── Student.js
-│   │   ├── MenuItem.js
+│   │   ├── Student.js         # +rechargeHistory, +dailyLimit
+│   │   ├── MenuItem.js        # +price
 │   │   └── Admin.js
 │   │
 │   ├── routes/
 │   │   ├── auth.routes.js
-│   │   ├── student.routes.js
-│   │   ├── sale.routes.js
+│   │   ├── student.routes.js  # +recharge, +bulk-recharge, +debtors
+│   │   ├── sale.routes.js     # +summary, +report/export, +analytics
 │   │   └── menu.routes.js
 │   │
 │   ├── controllers/
 │   │   ├── auth.controller.js
-│   │   ├── student.controller.js
-│   │   ├── sale.controller.js
+│   │   ├── student.controller.js  # updated: recharge, bulkRecharge, getDebtors, lookup adds todaySpent
+│   │   ├── sale.controller.js     # new: getDailySummary, exportSalesReport, getItemAnalytics
 │   │   └── menu.controller.js
 │   │
 │   ├── middleware/
@@ -74,12 +74,15 @@ Teapetti-backend/
 │   │   └── ApiError.js
 │   │
 │   └── app.js                 # Express app setup
-│
+|
 ├── .env
 ├── .env.example
 ├── package.json
 └── server.js                  # Entry point
 ```
+
+Notes:
+- Several feature additions in v2.0 require small schema changes and new controller routes — see the Database Schema and API Reference sections.
 
 ---
 
@@ -87,18 +90,28 @@ Teapetti-backend/
 
 ### 3.1 Student Model (`models/Student.js`)
 
+The `Student` model keeps an audit trail of purchases and recharges. New in v2.0:
+- `rechargeHistory` (array) — records top-ups with date, amount, note
+- `dailyLimit` (Number | null) — optional per-student daily spending cap
+
 ```js
 import mongoose from 'mongoose'
 
 const saleItemSchema = new mongoose.Schema({
-  name:  { type: String, required: true },   // 'Coffee' | 'Snack'
-  price: { type: Number, required: true },   // 10 | 15 | 5
+  name:  { type: String, required: true },
+  price: { type: Number, required: true },
 }, { _id: false })
 
 const transactionSchema = new mongoose.Schema({
   date:  { type: Date, default: Date.now },
   items: [saleItemSchema],
   total: { type: Number, required: true },
+}, { _id: true })
+
+const rechargeSchema = new mongoose.Schema({
+  date:   { type: Date,   default: Date.now },
+  amount: { type: Number, required: true },
+  note:   { type: String, default: '' },
 }, { _id: true })
 
 const studentSchema = new mongoose.Schema({
@@ -122,16 +135,16 @@ const studentSchema = new mongoose.Schema({
   balance: {
     type: Number,
     default: 0,
-    // Can go negative — credit-based system
   },
   totalCredit: { type: Number, default: 0 },
   totalSpent:  { type: Number, default: 0 },
   history: [transactionSchema],
+  rechargeHistory: { type: [rechargeSchema], default: [] },
+  dailyLimit: { type: Number, default: null },
 }, {
   timestamps: true,
 })
 
-// Virtual: recompute balance on the fly (optional — balance is also stored directly)
 studentSchema.virtual('computedBalance').get(function () {
   return this.totalCredit - this.totalSpent
 })
@@ -140,6 +153,8 @@ export default mongoose.model('Student', studentSchema)
 ```
 
 ### 3.2 MenuItem Model (`models/MenuItem.js`)
+
+In v2.0 `MenuItem` now includes a required `price` field.
 
 ```js
 import mongoose from 'mongoose'
@@ -151,12 +166,17 @@ const menuItemSchema = new mongoose.Schema({
     trim: true,
   },
   image: {
-    type: String,  // URL or path to image
+    type: String,
     required: true,
+  },
+  price: {
+    type: Number,
+    required: true,
+    min: 0,
   },
   isActive: {
     type: Boolean,
-    default: false,  // Admin must explicitly activate an item
+    default: false,
   },
 }, {
   timestamps: true,
@@ -167,23 +187,23 @@ export default mongoose.model('MenuItem', menuItemSchema)
 
 ### 3.3 Admin Model (`models/Admin.js`)
 
+Unchanged from v1.0: bcrypt-hashed password and helper `checkPassword()` method.
+
 ```js
 import mongoose from 'mongoose'
 import bcrypt from 'bcryptjs'
 
 const adminSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true },
-  password: { type: String, required: true },   // bcrypt hash
+  password: { type: String, required: true },
 }, { timestamps: true })
 
-// Hash password before save
 adminSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next()
   this.password = await bcrypt.hash(this.password, 12)
   next()
 })
 
-// Compare plain password against hash
 adminSchema.methods.checkPassword = function (plain) {
   return bcrypt.compare(plain, this.password)
 }
@@ -268,332 +288,110 @@ POST /api/auth/login
 
 ### 6.1 Auth Routes
 
-#### `POST /auth/login`
-
-Login as admin.
-
-**Request body:**
-```json
-{
-  "username": "admin",
-  "password": "secret123"
-}
-```
-
-**Response `200`:**
-```json
-{
-  "token": "eyJhbGc...",
-  "admin": { "username": "admin" }
-}
-```
-
-**Response `401`:**
-```json
-{ "error": "Invalid credentials" }
-```
-
----
-
-#### `POST /auth/logout`
-
-🔒 Protected. Stateless JWT — client discards the token. Server can optionally maintain a token blocklist.
-
-**Response `200`:**
-```json
-{ "message": "Logged out successfully" }
-```
+See v1.0 — `POST /auth/login` and `POST /auth/logout` remain the same.
 
 ---
 
 ### 6.2 Student Routes
 
+New v2.0 additions: `POST /students/:id/recharge`, `POST /students/bulk-recharge`, `GET /students/debtors`; `GET /students/lookup` now returns `todaySpent`.
+
 #### `GET /students` 🔒
 
-Returns all students. Supports optional class filter.
+Returns all students. Supports optional class filter and optional balance filters (e.g., `?maxBalance=-50`).
 
-**Query params:**
-
-| Param | Type | Description |
-|---|---|---|
-| `class` | String | Filter by class code, e.g. `?class=7A` |
-
-**Response `200`:**
-```json
-[
-  {
-    "_id": "...",
-    "admissionNumber": "3702",
-    "name": "Student Name",
-    "class": "7A",
-    "balance": -200,
-    "totalCredit": 305,
-    "totalSpent": 505
-  }
-]
-```
-
----
+Query params: `class`, optional `maxBalance`.
 
 #### `GET /students/lookup` — **Public**
 
-Lookup a single student by admission number (used on the user Students page).
+Now includes `todaySpent` (computed from `history`), useful for enforcing `dailyLimit` client-side.
 
-**Query params:**
-
-| Param | Type | Description |
-|---|---|---|
-| `admNo` | String | Admission number (required) |
-
-**Response `200`:**
-```json
-{
-  "_id": "...",
-  "admissionNumber": "3702",
-  "name": "Student Name",
-  "class": "8A",
-  "balance": -200,
-  "totalCredit": 305,
-  "totalSpent": 505,
-  "history": [
-    {
-      "_id": "...",
-      "date": "2024-11-12T00:00:00.000Z",
-      "items": [
-        { "name": "Coffee", "price": 10 },
-        { "name": "Snack",  "price": 15 }
-      ],
-      "total": 25
-    }
-  ]
-}
-```
-
-**Response `404`:**
-```json
-{ "error": "No student found with that admission number" }
-```
-
----
+Response shape adds `todaySpent` to the student object.
 
 #### `POST /students` 🔒
 
-Create a new student.
-
-**Request body:**
-```json
-{
-  "admissionNumber": "4001",
-  "name": "New Student",
-  "class": "4B",
-  "balance": 0
-}
-```
-
-**Validation rules (Zod):**
-- `admissionNumber`: required, non-empty string, unique
-- `name`: required, min 2 chars
-- `class`: must be one of the 12 valid class codes
-- `balance`: optional number, defaults to 0
-
-**Response `201`:** created student object  
-**Response `409`:** `{ "error": "Admission number already exists" }`
-
----
+Create a new student. Zod schema should include `dailyLimit` (optional).
 
 #### `PUT /students/:id` 🔒
 
-Update a student's details (name, class). Balance is managed by the sale system and is **not** directly editable here.
+Unchanged: used to update name/class/dailyLimit. Balance managed only via sales/recharge routes.
 
-**Request body:**
+#### `POST /students/:id/recharge` 🔒
+
+Top up a student's balance.
+
+Request body:
 ```json
 {
-  "name": "Updated Name",
-  "class": "5"
+  "amount": 100,
+  "note": "June fee collection"
 }
 ```
 
-**Response `200`:** updated student object
+Behaviour:
+- Validate amount > 0
+- Find student by id
+- Increment `balance` and `totalCredit`
+- Push `{ amount, note }` to `rechargeHistory`
 
----
-
-#### `DELETE /students/:id` 🔒
-
-Permanently delete a student and all their history.
-
-**Response `200`:**
+Response `200`:
 ```json
-{ "message": "Student deleted successfully" }
+{
+  "message": "Balance recharged",
+  "newBalance": -50,
+  "totalCredit": 405
+}
 ```
 
----
+#### `POST /students/bulk-recharge` 🔒
 
-#### `POST /students/import` 🔒
+Accepts an array of parsed Excel rows. Validates rows, finds students by `admissionNumber` and applies recharges. For large batches, use `bulkWrite`.
 
-Bulk import students from a parsed Excel file.
-
-**Request body:**
+Request body example:
 ```json
 {
   "rows": [
-    { "admissionNumber": "4001", "name": "Student A", "class": "4A", "balance": 0 },
-    { "admissionNumber": "4002", "name": "Student B", "class": "4A", "balance": 50 }
+    { "Admission No": "3702", "Amount": 100, "Note": "June collection" }
   ]
 }
 ```
 
-**Behaviour:**
-- Validates every row using the same Zod schema as `POST /students`
-- Uses MongoDB `bulkWrite` with `upsert: false` to skip existing admission numbers
-- Returns a summary of inserted vs skipped
+Response `200` summarizes `recharged`, `notFound`, and `total`.
 
-**Response `200`:**
-```json
-{
-  "inserted": 18,
-  "skipped":  2,
-  "skippedAdmNos": ["3001", "3002"]
-}
-```
+#### `GET /students/debtors` 🔒
 
----
-
-#### `GET /students/export` 🔒
-
-Returns all student data as a downloadable `.xlsx` file.
-
-**Response:** Binary `.xlsx` file stream  
-**Headers:**
-```
-Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
-Content-Disposition: attachment; filename="Teapetti_students.xlsx"
-```
+Returns students with negative balances grouped by class, sorted by class code. Useful for admin debt views and export.
 
 ---
 
 ### 6.3 Sale Routes
 
+New v2.0 additions: `GET /sales/summary/today`, `GET /sales/report/export`, `GET /sales/analytics/items`.
+
 #### `POST /sales` 🔒
 
-Record a completed sale. Deducts total from student balance and appends to history.
+Unchanged in core behaviour, but now includes server-side `dailyLimit` checks:
+- After validating the `total`, if `student.dailyLimit != null` compute `todaySpent` from `history` and reject if `todaySpent + serverTotal > dailyLimit`.
 
-**Request body:**
-```json
-{
-  "studentId": "3702",
-  "items": [
-    { "name": "Coffee", "price": 10 },
-    { "name": "Snack",  "price": 15 }
-  ],
-  "total": 25
-}
-```
+#### `GET /sales/summary/today` 🔒
 
-**Validation:**
-- `studentId`: must match an existing `admissionNumber`
-- `items`: array, min 1 item
-- Each item: `name` (string), `price` (number, must be 5 | 10 | 15)
-- `total`: must equal the sum of all item prices (server re-validates)
+Returns `totalRevenue`, `transactionCount`, and `topItem` for the current calendar day. Implemented by aggregating `Student.history` documents.
 
-**Behaviour (atomic):**
-```js
-// Inside a Mongoose session / transaction:
-student.balance    -= total
-student.totalSpent += total
-student.history.push({ date: new Date(), items, total })
-await student.save()
-```
+#### `GET /sales/report/export?from=YYYY-MM-DD&to=YYYY-MM-DD` 🔒
 
-**Response `201`:**
-```json
-{
-  "message": "Sale recorded successfully",
-  "newBalance": -200,
-  "transaction": {
-    "_id": "...",
-    "date": "2024-11-20T10:30:00.000Z",
-    "items": [...],
-    "total": 25
-  }
-}
-```
+Streams an `.xlsx` report with multiple sheets: **Summary**, **Per-Class Spending**, and **Item Breakdown**. Validates date range and aggregates transactions in the range.
 
-**Response `400`:**
-```json
-{ "error": "Total mismatch: expected 25, got 20" }
-```
+#### `GET /sales/analytics/items?range=week|month` 🔒
 
-**Response `404`:**
-```json
-{ "error": "Student not found" }
-```
+Returns item-wise counts and revenue for the requested range (default week).
 
 ---
 
 ### 6.4 Menu Routes
 
-#### `GET /menu` — **Public**
+`MenuItem` now returns `price` with each menu item. `POST /menu` requires `price` in the body and the `GET /menu` response includes `price`.
 
-Returns all menu items. Supports `isActive` filter.
-
-**Query params:**
-
-| Param | Type | Description |
-|---|---|---|
-| `active` | Boolean | `?active=true` returns only active items (used by user portal) |
-
-**Response `200`:**
-```json
-[
-  {
-    "_id": "...",
-    "name": "Filter Coffee",
-    "image": "https://...",
-    "isActive": true
-  }
-]
-```
-
----
-
-#### `PATCH /menu/:id` 🔒
-
-Toggle a menu item's active status.
-
-**Request body:**
-```json
-{ "isActive": true }
-```
-
-**Response `200`:** updated menu item object
-
----
-
-#### `POST /menu` 🔒
-
-Add a new menu item to the pool.
-
-**Request body:**
-```json
-{
-  "name": "Masala Tea",
-  "image": "https://...",
-  "isActive": false
-}
-```
-
-**Response `201`:** created menu item
-
----
-
-#### `DELETE /menu/:id` 🔒
-
-Remove a menu item permanently.
-
-**Response `200`:**
-```json
-{ "message": "Menu item removed" }
-```
+The `PATCH /menu/:id` and `DELETE /menu/:id` routes are unchanged in semantics.
 
 ---
 
@@ -601,156 +399,75 @@ Remove a menu item permanently.
 
 ### 7.1 Balance System
 
-The shop operates on a **credit system** — students may have a pre-loaded balance or run a tab.
-
-```
 balance = totalCredit − totalSpent
-```
 
-- Negative balance is **allowed** — the student owes money
+- Negative balance is allowed — the student owes money
 - Balance is stored directly on the student document for fast reads
 - `totalCredit` and `totalSpent` are stored for full audit trail
-- The sale endpoint is the **only** way to modify `balance` and `totalSpent`
+- The sale endpoint remains the only way to modify `totalSpent`; recharges modify `balance` and `totalCredit` and are recorded in `rechargeHistory`.
 
 ### 7.2 Sale Validation (server-side)
 
-Even though the frontend sends a `total`, the server **recomputes and validates** it:
+Server always recomputes and validates sale totals and item prices. Additionally:
+- If `student.dailyLimit` is set, compute `todaySpent` from `history` and reject the sale if it would exceed the limit.
+
+Example validation snippet:
 
 ```js
 const serverTotal = items.reduce((sum, item) => sum + item.price, 0)
-if (serverTotal !== body.total) {
-  throw new ApiError(400, `Total mismatch: expected ${serverTotal}, got ${body.total}`)
-}
+if (serverTotal !== body.total) throw new ApiError(400, `Total mismatch: expected ${serverTotal}, got ${body.total}`)
 
 const allowedPrices = [5, 10, 15]
 for (const item of items) {
-  if (!allowedPrices.includes(item.price)) {
-    throw new ApiError(400, `Invalid price: ${item.price}`)
+  if (!allowedPrices.includes(item.price)) throw new ApiError(400, `Invalid price: ${item.price}`)
+}
+
+if (student.dailyLimit != null) {
+  const startOfDay = new Date(); startOfDay.setHours(0,0,0,0)
+  const todaySpent = student.history.filter(tx => new Date(tx.date) >= startOfDay).reduce((s, tx) => s + tx.total, 0)
+  if (todaySpent + serverTotal > student.dailyLimit) {
+    throw new ApiError(400, `Daily spending limit of ₹${student.dailyLimit} would be exceeded. Already spent ₹${todaySpent} today.`)
   }
 }
 ```
 
 ### 7.3 Class Codes
 
-Valid class codes are enforced at the model level:
+Same enum validation as before.
 
-```js
-enum: ['1A','1B','2A','2B','3','4A','4B','5','6A','6B','7A','7B']
-```
+### 7.4 Menu Prices & Active State
 
-Any attempt to set an invalid class (via API or import) is rejected with a `400`.
-
-### 7.4 Menu Active State
-
-- Only items with `isActive: true` are returned by `GET /menu?active=true`
-- The admin's Menu Management page fetches all items and splits them client-side (or the API can split them using query params)
-- There is no limit on how many items can be active simultaneously
+- Items include `price` now and are returned in `GET /menu`.
+- `isActive` filtering remains supported.
 
 ---
 
-## 8. Excel Import/Export
+## 8. Excel Import/Export & Reports
+
+This section documents both the existing student import/export and the new sales report export and bulk recharge handling.
 
 ### 8.1 Import (`utils/excelImport.js`)
 
-Called by `POST /students/import`. The frontend sends parsed JSON rows; the backend validates and bulk inserts.
+Called by `POST /students/import`. Validates rows with Zod and `bulkWrite` to upsert new students (skip existing by admission number).
 
-```js
-import Student from '../models/Student.js'
-import { ApiError } from './ApiError.js'
-import { z } from 'zod'
+Row schema should include `dailyLimit` if provided.
 
-const rowSchema = z.object({
-  admissionNumber: z.string().min(1),
-  name:            z.string().min(2),
-  class:           z.enum(['1A','1B','2A','2B','3','4A','4B','5','6A','6B','7A','7B']),
-  balance:         z.coerce.number().default(0),
-})
+### 8.2 Export Students (`utils/excelExport.js`)
 
-export async function importStudents(rows) {
-  const valid   = []
-  const invalid = []
+`GET /students/export` streams a students `.xlsx` with balances highlighted; unchanged from v1.0 aside from added columns (e.g., `dailyLimit` if desired).
 
-  for (const row of rows) {
-    const result = rowSchema.safeParse(row)
-    if (result.success) valid.push(result.data)
-    else invalid.push({ row, errors: result.error.flatten() })
-  }
+### 8.3 Sales Report Export (`controllers/sale.controller.js`)
 
-  if (invalid.length) {
-    throw new ApiError(400, 'Validation errors in import', invalid)
-  }
+`GET /sales/report/export?from=YYYY-MM-DD&to=YYYY-MM-DD` produces a workbook with:
+- Sheet 1: Summary (period, total revenue, total transactions)
+- Sheet 2: Per-Class Spending
+- Sheet 3: Item Breakdown (units sold, revenue)
 
-  const ops = valid.map(s => ({
-    updateOne: {
-      filter: { admissionNumber: s.admissionNumber },
-      update: { $setOnInsert: s },
-      upsert: true,
-    }
-  }))
+Example: uses an aggregation over `Student.history`, builds `ExcelJS` workbook and streams it back.
 
-  const result = await Student.bulkWrite(ops, { ordered: false })
-  return {
-    inserted: result.upsertedCount,
-    skipped:  result.matchedCount,
-  }
-}
-```
+### 8.4 Bulk Recharge
 
-### 8.2 Export (`utils/excelExport.js`)
-
-Called by `GET /students/export`. Streams an `.xlsx` file to the response.
-
-```js
-import ExcelJS from 'exceljs'
-import Student from '../models/Student.js'
-
-export async function exportStudents(res) {
-  const students = await Student.find().sort({ class: 1, admissionNumber: 1 })
-
-  const wb = new ExcelJS.Workbook()
-  const ws = wb.addWorksheet('Students')
-
-  ws.columns = [
-    { header: 'Admission No', key: 'admissionNumber', width: 16 },
-    { header: 'Name',         key: 'name',            width: 28 },
-    { header: 'Class',        key: 'class',           width: 10 },
-    { header: 'Balance (₹)', key: 'balance',          width: 14 },
-    { header: 'Total Credit', key: 'totalCredit',     width: 14 },
-    { header: 'Total Spent',  key: 'totalSpent',      width: 14 },
-  ]
-
-  // Style header row
-  ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } }
-  ws.getRow(1).fill = { type: 'pattern', pattern: 'solid',
-                         fgColor: { argb: 'FFE07B1A' } }
-
-  students.forEach(s => ws.addRow({
-    admissionNumber: s.admissionNumber,
-    name:            s.name,
-    class:           s.class,
-    balance:         s.balance,
-    totalCredit:     s.totalCredit,
-    totalSpent:      s.totalSpent,
-  }))
-
-  // Highlight negative balances in red
-  ws.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return
-    const balanceCell = row.getCell('balance')
-    if (balanceCell.value < 0) {
-      balanceCell.font = { color: { argb: 'FFE53935' }, bold: true }
-    }
-  })
-
-  res.setHeader('Content-Type',
-    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-  res.setHeader('Content-Disposition',
-    'attachment; filename="Teapetti_students.xlsx"')
-
-  await wb.xlsx.write(res)
-  res.end()
-}
-```
+`POST /students/bulk-recharge` accepts parsed rows with `Admission No`, `Amount`, `Note`. For large batches prefer a `bulkWrite` updating `balance` and `totalCredit` and `$push`ing to `rechargeHistory`.
 
 ---
 
@@ -773,26 +490,16 @@ export class ApiError extends Error {
 ```js
 app.use((err, req, res, next) => {
   if (err instanceof ApiError) {
-    return res.status(err.statusCode).json({
-      error:   err.message,
-      details: err.details ?? undefined,
-    })
+    return res.status(err.statusCode).json({ error: err.message, details: err.details ?? undefined })
   }
 
-  // Mongoose validation error
   if (err.name === 'ValidationError') {
-    return res.status(400).json({
-      error:   'Validation failed',
-      details: Object.values(err.errors).map(e => e.message),
-    })
+    return res.status(400).json({ error: 'Validation failed', details: Object.values(err.errors).map(e => e.message) })
   }
 
-  // Mongoose duplicate key
   if (err.code === 11000) {
     const field = Object.keys(err.keyValue)[0]
-    return res.status(409).json({
-      error: `${field} already exists`,
-    })
+    return res.status(409).json({ error: `${field} already exists` })
   }
 
   console.error(err)
@@ -806,7 +513,7 @@ app.use((err, req, res, next) => {
 |---|---|---|
 | `200` | OK | Successful GET / PATCH |
 | `201` | Created | Successful POST |
-| `400` | Bad Request | Validation failure, total mismatch |
+| `400` | Bad Request | Validation failure, total mismatch, limit exceeded |
 | `401` | Unauthorized | Missing or invalid JWT |
 | `404` | Not Found | Student / item not found |
 | `409` | Conflict | Duplicate admission number |
@@ -858,7 +565,6 @@ app.use('/api/students', studentRoutes)
 app.use('/api/sales',    saleRoutes)
 app.use('/api/menu',     menuRoutes)
 
-// Global error handler (see Section 9)
 app.use(errorHandler)
 
 export default app

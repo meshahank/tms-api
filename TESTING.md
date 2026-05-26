@@ -1,290 +1,162 @@
-# Teapetti Backend — Testing Guide
+# Teapetti API Guide — Testing & Endpoints (v2.0)
 
-This document describes how to test the Teapetti backend (unit, integration, and manual API tests), plus recommended dev dependencies and CI configuration.
+Base URL: `http://localhost:5000/api`
 
-**Quick start**
+Authentication: admin routes require `Authorization: Bearer <token>` (JWT). Public routes do not.
 
-1. Install dev dependencies (see `package.json` and commands below).
-2. Create a `.env.test` file (example below).
-3. Run unit tests: `npm test` (after adding test script).
-4. Run integration tests: `npm run test:integration`.
-
-**Files referenced**
-- Server entry: [server.js](server.js)
-- App: [src/app.js](src/app.js)
-- Seed script: [src/seed.js](src/seed.js)
+Quick notes:
+- Use `POST /api/auth/login` to obtain a token for protected routes.
+- All request/response bodies are JSON unless noted (the report export streams `.xlsx`).
 
 ---
 
-## Recommended Test Dependencies
+## Auth
 
-Install the following as dev dependencies:
+POST /api/auth/login
+- Body: `{ "username": "admin", "password": "..." }`
+- Response: `{ "token": "...", "admin": { "username": "admin" } }`
 
-```bash
-npm install -D jest @types/jest supertest mongodb-memory-server-core cross-env
+POST /api/auth/logout
+- Protected. Client may simply discard token.
+
+---
+
+## Students
+
+GET /api/students
+- Protected. Query params: `class` (optional), `maxBalance` (optional, number)
+- Returns a list of students (no `history` by default).
+
+GET /api/students/lookup?admNo=3702
+- Public. Returns full student object + `todaySpent` (computed for current day).
+
+POST /api/students
+- Protected. Create student.
+- Body example:
 ```
-
-- `jest`: test runner and assertion library.
-- `supertest`: HTTP assertions for integration tests.
-- `mongodb-memory-server-core`: ephemeral in-memory MongoDB for fast, isolated integration tests.
-- `cross-env`: set environment variables in npm scripts across platforms.
-
-You can also use `vitest` instead of `jest` if you prefer a faster modern runner.
-
----
-
-## Suggested package.json scripts
-
-Add these scripts to `package.json`:
-
-```json
-"scripts": {
-  "dev": "nodemon server.js",
-  "start": "node server.js",
-  "seed": "node src/seed.js",
-  "test": "cross-env NODE_ENV=test jest --runInBand",
-  "test:watch": "cross-env NODE_ENV=test jest --watch",
-  "test:integration": "cross-env NODE_ENV=test jest --runInBand --config jest.integration.config.js"
+{
+  "admissionNumber": "4001",
+  "name": "Student Name",
+  "class": "4A",
+  "balance": 0,
+  "dailyLimit": null
 }
 ```
 
-Notes:
-- `--runInBand` runs tests serially which is easier for tests that spin up a real or in-memory DB.
-- Consider separate Jest configs for unit vs integration tests.
+PUT /api/students/:id
+- Protected. Update student fields (`name`, `class`, `dailyLimit`).
+
+DELETE /api/students/:id
+- Protected. Delete student.
+
+POST /api/students/import
+- Protected. Body: `{ "rows": [ ... ] }` — parsed Excel rows. See import schema in code.
+
+GET /api/students/export
+- Protected. Streams `.xlsx` of students.
+
+POST /api/students/:id/recharge
+- Protected. Recharge a single student.
+- Body: `{ "amount": 100, "note": "June collection" }`
+- Response: `{ "message": "Balance recharged", "newBalance": <number>, "totalCredit": <number> }`
+
+POST /api/students/bulk-recharge
+- Protected. Body: `{ "rows": [ { "Admission No": "3702", "Amount": 100, "Note": "..." }, ... ] }`
+- Response summarizes recharged, notFound, total.
+
+GET /api/students/debtors
+- Protected. Returns classes with negative-balance students grouped and totals.
 
 ---
 
-## Environment for tests
+## Sales
 
-Create a `.env.test` at the project root with test-specific values. Example:
-
+POST /api/sales
+- Protected. Record a sale.
+- Body example:
 ```
-PORT=5001
-NODE_ENV=test
-MONGO_URI=mongodb://127.0.0.1:27017/Teapetti_test
-JWT_SECRET=test_jwt_secret
-JWT_EXPIRES_IN=7d
-CLIENT_URL=http://localhost:5173
+{
+  "studentId": "3702",         // admissionNumber
+  "items": [ { "name": "Coffee", "price": 10 } ],
+  "total": 10
+}
 ```
+- Server re-validates item prices and total.
+- If student has `dailyLimit`, the server rejects sales that would exceed it.
 
-In integration tests we prefer `mongodb-memory-server` so `MONGO_URI` is created dynamically by the test harness — see the example below.
+GET /api/sales/summary/today
+- Protected. Response: `{ totalRevenue, transactionCount, topItem }`
+
+GET /api/sales/report/export?from=YYYY-MM-DD&to=YYYY-MM-DD
+- Protected. Streams `.xlsx` file containing Summary, Per-Class Spending, and Item Breakdown.
+
+GET /api/sales/analytics/items?range=week|month
+- Protected. Default `week`. Returns item counts and revenue in the requested window.
 
 ---
 
-## Unit tests (fast, pure logic)
+## Menu
 
-- Focus on utilities and pure functions (e.g. `src/utils/studentFinancials.js`).
-- Use Jest to test small units with deterministic inputs.
+GET /api/menu
+- Public. Optional query `?active=true` returns only active items.
+- Each item now includes `price`.
 
-Example `tests/utils/studentFinancials.test.js`:
+POST /api/menu
+- Protected. Body: `{ "name": "Masala Tea", "image": "https://...", "price": 10, "isActive": false }`
 
-```js
-import { buildStudentFinancials } from '../../src/utils/studentFinancials.js';
+PATCH /api/menu/:id
+- Protected. Toggle `isActive`.
 
-test('builds correct financials for positive balance', () => {
-  expect(buildStudentFinancials(120)).toEqual({ balance: 120, totalCredit: 120, totalSpent: 0 });
-});
+DELETE /api/menu/:id
+- Protected. Delete item.
 
-test('builds correct financials for negative balance', () => {
-  expect(buildStudentFinancials(-50)).toEqual({ balance: -50, totalCredit: 0, totalSpent: 50 });
-});
-```
+---
 
-Run unit tests with:
+## Error codes
+- `400` Bad Request — validation errors, total mismatch, limit exceeded
+- `401` Unauthorized — missing/invalid JWT
+- `404` Not Found — student/menu not found
+- `409` Conflict — duplicate admission number
+- `500` Internal Server Error — unexpected
 
+---
+
+## Quick curl examples
+
+Login and save token (bash):
 ```bash
-npm test
-```
-
----
-
-## Integration tests (API + DB)
-
-These tests exercise the full Express stack and a real MongoDB (in-memory for CI/local).
-
-Key ideas:
-- Start the app using the `app` import (do not call `server.listen` directly in tests).
-- Use `mongodb-memory-server` to create a MongoDB URI per test run.
-- Use `supertest` to make HTTP requests against `app`.
-- Seed required data (admin) in a `beforeAll` hook and clean up between tests.
-
-Example `tests/integration/sale.integration.test.js`:
-
-```js
-import request from 'supertest';
-import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server-core';
-import app from '../../src/app.js';
-import Admin from '../../src/models/Admin.js';
-
-let mongod;
-
-beforeAll(async () => {
-  mongod = await MongoMemoryServer.create();
-  const uri = mongod.getUri();
-  await mongoose.connect(uri);
-  await Admin.create({ username: 'admin', password: 'changeme123' });
-});
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongod.stop();
-});
-
-test('record a sale updates student balance and history', async () => {
-  // create a student
-  const createRes = await request(app)
-    .post('/api/students')
-    .set('Authorization', `Bearer dummy`) // you may mock auth or issue real JWT
-    .send({ admissionNumber: 'T100', name: 'Test Student', class: '4A' });
-
-  // For a proper test obtain a token via /api/auth/login or mock protect middleware
-  // This example focuses on structure; adapt auth to your test approach.
-  expect(createRes.status).toBe(201);
-});
-```
-
-Auth in integration tests:
-- Option A: Use the real `/api/auth/login` endpoint and store token.
-- Option B: Bypass `protect` by mocking the middleware (only for isolated tests).
-
----
-
-## Manual API tests (curl / Postman)
-
-Use these curl snippets to exercise the running server at `http://localhost:5000`.
-
-- Login (admin):
-
-```bash
-curl -X POST http://localhost:5000/api/auth/login \
+curl -s -X POST http://localhost:5000/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"changeme123"}'
+  -d '{"username":"admin","password":"changeme123"}' | jq -r '.token' > token.txt
 ```
 
-- Create a student (requires admin token):
-
+Lookup student (public):
 ```bash
-curl -X POST http://localhost:5000/api/students \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer <TOKEN>' \
-  -d '{"admissionNumber":"4001","name":"Student A","class":"4A","balance":0}'
+curl http://localhost:5000/api/students/lookup?admNo=3702
 ```
 
-- Lookup student (public):
-
+Create sale (protected):
 ```bash
-curl "http://localhost:5000/api/students/lookup?admNo=4001"
-```
-
-- Record a sale (admin):
-
-```bash
+TOKEN=$(cat token.txt)
 curl -X POST http://localhost:5000/api/sales \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer <TOKEN>' \
-  -d '{"studentId":"4001","items":[{"name":"Coffee","price":10}],"total":10}'
+  -d '{"studentId":"3702","items":[{"name":"Coffee","price":10}],"total":10}'
 ```
 
----
-
-## Excel import/export tests
-
-- To exercise import: send a POST to `/api/students/import` with a JSON body `{ "rows": [ ... ] }` as specified in the docs.
-- To test export: GET `/api/students/export` while authenticated; the response will be an `.xlsx` file stream.
-
-You can write an integration test that uploads parsed rows or call the import helper directly from tests.
-
----
-
-## CI (GitHub Actions) example
-
-Save this as `.github/workflows/ci.yml`:
-
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm ci
-      - run: npm test
-        env:
-          NODE_ENV: test
-```
-
-If using `mongodb-memory-server`, tests that require MongoDB will run without external services.
-
----
-
-## Troubleshooting
-
-- If tests fail due to `EADDRINUSE`, ensure test server uses a different port or do not call `app.listen` during tests — import `app` directly.
-- If MongoDB connection fails, verify `mongodb-memory-server` is installed and compatible with your Node version.
-- For JWT-related failures in tests, either issue a real token via `/api/auth/login` against the seeded admin, or mock the `protect` middleware.
-
----
-
-If you'd like, I can also:
-
-- Add example Jest config files (`jest.config.js` and `jest.integration.config.js`).
-- Add sample test files for unit and integration tests.
-- Commit sample CI YAML into the repo.
-
-Tell me which of those you'd like me to create next.
-
----
-
-## API Endpoints (complete list)
-
-Below is a concise, authoritative list of all backend API endpoints implemented in this repository, with HTTP method, path, whether authentication is required, a short description, and example curl commands you can run locally.
-
-Base URL: http://localhost:5000
-
-- **Health**
-  - Method: GET
-  - Path: `/health`
-  - Auth: none
-  - Description: Basic liveness check.
-  - Test:
-
+Export sales report (download):
 ```bash
-curl http://localhost:5000/health
+curl -G -o report.xlsx "http://localhost:5000/api/sales/report/export" \
+  -H "Authorization: Bearer $TOKEN" --data-urlencode "from=2024-05-01" --data-urlencode "to=2024-05-31"
 ```
 
-- **Auth**
-  - Login
-    - Method: POST
-    - Path: `/api/auth/login`
-    - Auth: none
-    - Description: Returns a JWT for admin users.
-    - Request body: `{ "username": "admin", "password": "changeme123" }`
-    - Test:
+---
 
-```bash
-curl -X POST http://localhost:5000/api/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"changeme123"}'
-```
+If you want, I can also:
+- Add automated tests for new endpoints (Jest + supertest).
+- Implement bulkWrite optimization for `bulk-recharge` for large batches.
+- Add OpenAPI / Postman collection.
 
-  - Logout
-    - Method: POST
-    - Path: `/api/auth/logout`
-    - Auth: Bearer token (admin)
-    - Description: Stateless logout endpoint (client-side token discard).
-    - Test:
-
-```bash
-curl -X POST http://localhost:5000/api/auth/logout \
-  -H 'Authorization: Bearer <TOKEN>'
-```
-
-- **Students**
   - Get all students
     - Method: GET
     - Path: `/api/students`
